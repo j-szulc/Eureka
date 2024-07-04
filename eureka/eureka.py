@@ -70,6 +70,7 @@ def main(cfg):
     max_success_overall = DUMMY_FAILURE
     max_success_reward_correlation_overall = DUMMY_FAILURE
     max_reward_code_path = None 
+    last_best_ckpt = None
     
     # Eureka generation loop
     for iter in range(cfg.iteration):
@@ -188,17 +189,18 @@ def main(cfg):
             
             # Execute the python file with flags
             rl_filepath = f"env_iter{iter}_response{response_id}.txt"
+            ckpt_arg = [f'checkpoint={last_best_ckpt}'] if last_best_ckpt is not None and cfg.stateful else []
             with open(rl_filepath, 'w') as f:
                 process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',  
                                             'hydra/output=subprocess',
                                             f'task={task}{suffix}', f'wandb_activate={cfg.use_wandb}',
                                             f'wandb_entity={cfg.wandb_username}', f'wandb_project={cfg.wandb_project}',
                                             f'headless={not cfg.capture_video}', f'capture_video={cfg.capture_video}', 'force_render=False',
-                                            f'max_iterations={cfg.max_iterations}'],
+                                            f'max_iterations={cfg.max_iterations}',
+                                            *ckpt_arg],
                                             stdout=f, stderr=f)
             block_until_training(rl_filepath, log_status=True, iter_num=iter, response_id=response_id)
             rl_runs.append(process)
-        
         # Gather RL training results and construct reward reflection
         code_feedbacks = []
         contents = []
@@ -207,6 +209,7 @@ def main(cfg):
         code_paths = []
         
         exec_success = False 
+        ckpts = {}
         for response_id, (code_run, rl_run) in enumerate(zip(code_runs, rl_runs)):
             rl_run.communicate()
             rl_filepath = f"env_iter{iter}_response{response_id}.txt"
@@ -234,6 +237,14 @@ def main(cfg):
                         break 
                 tensorboard_logdir = line.split(':')[-1].strip() 
                 tensorboard_logs = load_tensorboard_logs(tensorboard_logdir)
+                ckpt = list((Path(tensorboard_logdir) / ".." / "nn").rglob("last_*.pth"))
+                if len(ckpt) > 1:
+                    logging.warning(f"Multiple checkpoints found for response_id {response_id}: {ckpt}")
+                elif len(ckpt) == 0:
+                    logging.warning(f"No checkpoints found for response_id {response_id}")
+                else:
+                    ckpt = ckpt[0]
+                    ckpts[response_id] = ckpt
                 max_iterations = np.array(tensorboard_logs['gt_reward']).shape[0]
                 epoch_freq = max(int(max_iterations // 10), 1)
                 
@@ -288,7 +299,10 @@ def main(cfg):
         # Select the best code sample based on the success rate
         best_sample_idx = np.argmax(np.array(successes))
         best_content = contents[best_sample_idx]
-            
+        if best_sample_idx in ckpts:
+            last_best_ckpt = ckpts[best_sample_idx]
+        else:
+            logging.warning(f"Best sample index {best_sample_idx} doesn't have a checkpoint!")
         max_success = successes[best_sample_idx]
         max_success_reward_correlation = reward_correlations[best_sample_idx]
         execute_rate = np.sum(np.array(successes) >= 0.) / cfg.sample
