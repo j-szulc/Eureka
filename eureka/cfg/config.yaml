@@ -10,6 +10,7 @@ hydra:
 
 # LLM parameters
 model: gpt-4-0314  # LLM model (other options are gpt-4, gpt-4-0613, gpt-3.5-turbo-16k-0613)
+local_model_filename: ""
 temperature: 1.0
 suffix: GPT  # suffix for generated files (indicates LLM model)
 
@@ -19,6 +20,7 @@ sample: 3 # number of Eureka samples to generate per iteration
 max_iterations: 3000 # RL Policy training iterations (decrease this to make the feedback loop faster)
 num_eval: 5 # number of evaluation episodes to run for the final reward
 capture_video: False # whether to capture policy rollout videos
+add_image: False # only use with gpt-4o
 
 # Weights and Biases
 use_wandb: False # whether to use wandb for logging
