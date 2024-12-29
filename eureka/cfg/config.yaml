@@ -20,8 +20,11 @@ sample: 3 # number of Eureka samples to generate per iteration
 max_iterations: 3000 # RL Policy training iterations (decrease this to make the feedback loop faster)
 num_eval: 5 # number of evaluation episodes to run for the final reward
 capture_video: False # whether to capture policy rollout videos
+add_image: False # only use with gpt-4o
 
 # Weights and Biases
 use_wandb: False # whether to use wandb for logging
 wandb_username: "" # wandb username if logging with wandb
 wandb_project: "" # wandb project if logging with wandb
+
+stateful: False # whether to use stateful reward reflection, which continues the training from the best checkpoint from the previous iteration

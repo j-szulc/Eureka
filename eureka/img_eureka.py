@@ -1,20 +1,22 @@
-import hydra
-import numpy as np 
+import io
 import json
-import logging 
-import matplotlib.pyplot as plt
+import logging
 import os
-import openai
 import re
-import subprocess
-from pathlib import Path
 import shutil
-import time 
+import subprocess
+import time
+from base64 import b64encode
+from pathlib import Path
 
-from utils.misc import * 
-from utils.file_utils import find_files_with_substring, load_tensorboard_logs
+import hydra
+import matplotlib.pyplot as plt
+import numpy as np
+import openai
 from utils.create_task import create_task
 from utils.extract_task_code import *
+from utils.file_utils import find_files_with_substring, load_tensorboard_logs
+from utils.misc import *
 
 EUREKA_ROOT_DIR = os.getcwd()
 ISAAC_ROOT_DIR = f"{EUREKA_ROOT_DIR}/../isaacgymenvs/isaacgymenvs"
@@ -31,6 +33,7 @@ def main(cfg):
     task_description = cfg.env.description
     suffix = cfg.suffix
     model = cfg.model
+    assert not cfg.add_image or model == 'gpt-4o', "Image viewing is only supported for GPT-4o!"
     logging.info(f"Using LLM: {model}")
     logging.info("Task: " + task)
     logging.info("Task description: " + task_description)
@@ -70,7 +73,6 @@ def main(cfg):
     max_success_overall = DUMMY_FAILURE
     max_success_reward_correlation_overall = DUMMY_FAILURE
     max_reward_code_path = None 
-    last_best_ckpt = None
     
     # Eureka generation loop
     for iter in range(cfg.iteration):
@@ -189,18 +191,17 @@ def main(cfg):
             
             # Execute the python file with flags
             rl_filepath = f"env_iter{iter}_response{response_id}.txt"
-            ckpt_arg = [f'checkpoint={last_best_ckpt}'] if last_best_ckpt is not None and cfg.stateful else []
             with open(rl_filepath, 'w') as f:
                 process = subprocess.Popen(['python', '-u', f'{ISAAC_ROOT_DIR}/train.py',  
                                             'hydra/output=subprocess',
                                             f'task={task}{suffix}', f'wandb_activate={cfg.use_wandb}',
                                             f'wandb_entity={cfg.wandb_username}', f'wandb_project={cfg.wandb_project}',
                                             f'headless={not cfg.capture_video}', f'capture_video={cfg.capture_video}', 'force_render=False',
-                                            f'max_iterations={cfg.max_iterations}',
-                                            *ckpt_arg],
+                                            f'max_iterations={cfg.max_iterations}'],
                                             stdout=f, stderr=f)
             block_until_training(rl_filepath, log_status=True, iter_num=iter, response_id=response_id)
             rl_runs.append(process)
+        
         # Gather RL training results and construct reward reflection
         code_feedbacks = []
         contents = []
@@ -209,7 +210,6 @@ def main(cfg):
         code_paths = []
         
         exec_success = False 
-        ckpts = {}
         for response_id, (code_run, rl_run) in enumerate(zip(code_runs, rl_runs)):
             rl_run.communicate()
             rl_filepath = f"env_iter{iter}_response{response_id}.txt"
@@ -225,7 +225,7 @@ def main(cfg):
                 reward_correlations.append(DUMMY_FAILURE)
                 continue
 
-            content = ''
+            content = []
             traceback_msg = filter_traceback(stdout_str)
 
             if traceback_msg == '':
@@ -237,18 +237,11 @@ def main(cfg):
                         break 
                 tensorboard_logdir = line.split(':')[-1].strip() 
                 tensorboard_logs = load_tensorboard_logs(tensorboard_logdir)
-                ckpt = list((Path(tensorboard_logdir) / ".." / "nn").rglob("last_*.pth"))
-                if len(ckpt) > 1:
-                    logging.warning(f"Multiple checkpoints found for response_id {response_id}: {ckpt}")
-                elif len(ckpt) == 0:
-                    logging.warning(f"No checkpoints found for response_id {response_id}")
-                else:
-                    ckpt = ckpt[0]
-                    ckpts[response_id] = ckpt
                 max_iterations = np.array(tensorboard_logs['gt_reward']).shape[0]
                 epoch_freq = max(int(max_iterations // 10), 1)
                 
-                content += policy_feedback.format(epoch_freq=epoch_freq)
+                dcontent = policy_feedback.format(epoch_freq=epoch_freq)
+                content.append({'type': 'text', 'text': dcontent})
                 
                 # Compute Correlation between Human-Engineered and GPT Rewards
                 if "gt_reward" in tensorboard_logs and "gpt_reward" in tensorboard_logs:
@@ -271,22 +264,41 @@ def main(cfg):
                                 metric_name = metric 
                             else:
                                 metric_name = "task_score"
-                            content += f"{metric_name}: {metric_cur}, Max: {metric_cur_max:.2f}, Mean: {metric_cur_mean:.2f}, Min: {metric_cur_min:.2f} \n"                    
+                            metric1 = f"{metric_name}: {metric_cur}, Max: {metric_cur_max:.2f}, Mean: {metric_cur_mean:.2f}, Min: {metric_cur_min:.2f} \n"                    
+                            content.append({'type': 'text', 'text': metric1})
                         else:
                             # Provide ground-truth score when success rate not applicable
                             if "consecutive_successes" not in tensorboard_logs:
-                                content += f"ground-truth score: {metric_cur}, Max: {metric_cur_max:.2f}, Mean: {metric_cur_mean:.2f}, Min: {metric_cur_min:.2f} \n"                    
+                                metric2 = f"ground-truth score: {metric_cur}, Max: {metric_cur_max:.2f}, Mean: {metric_cur_mean:.2f}, Min: {metric_cur_min:.2f} \n"                    
+                                content.append({'type': 'text', 'text': metric2})
+                        if cfg.add_image:
+                            ys = tensorboard_logs[metric]
+                            plt.plot(ys)
+                            plt.xlabel('Epoch')
+                            plt.ylabel('Rewards')
+                            plt.title(metric)
+                            plt.xticks(range(len(ys)))
+                            #img_path = f"env_iter{iter}_response{response_id}_{metric}.png"
+                            #plt.savefig(img_path)
+                            # In memory image sending
+                            img = io.BytesIO()
+                            plt.savefig(img, format='png', bbox_inches="tight")
+                            #plt.close()
+                            img_base64 = b64encode(img.getvalue()).decode('utf-8')
+                            img_str = f"data:image/png;base64,{img_base64}"
+                            content.append({'type': 'image_url', 'image_url': {'url': img_str}})
                 code_feedbacks.append(code_feedback)
-                content += code_feedback  
+                content.append({'type': 'text', 'text': code_feedback})
             else:
                 # Otherwise, provide execution traceback error feedback
                 successes.append(DUMMY_FAILURE)
                 reward_correlations.append(DUMMY_FAILURE)
-                content += execution_error_feedback.format(traceback_msg=traceback_msg)
+                errcontent = execution_error_feedback.format(traceback_msg=traceback_msg)
+                content.append({'type': 'text', 'text': errcontent})
 
-            content += code_output_tip
+            content.append({'type': 'text', 'text': code_output_tip})
             contents.append(content) 
-        
+
         # Repeat the iteration if all code generation failed
         if not exec_success and cfg.sample != 1:
             execute_rates.append(0.)
@@ -299,10 +311,7 @@ def main(cfg):
         # Select the best code sample based on the success rate
         best_sample_idx = np.argmax(np.array(successes))
         best_content = contents[best_sample_idx]
-        if best_sample_idx in ckpts:
-            last_best_ckpt = ckpts[best_sample_idx]
-        else:
-            logging.warning(f"Best sample index {best_sample_idx} doesn't have a checkpoint!")
+            
         max_success = successes[best_sample_idx]
         max_success_reward_correlation = reward_correlations[best_sample_idx]
         execute_rate = np.sum(np.array(successes) >= 0.) / cfg.sample
@@ -321,7 +330,8 @@ def main(cfg):
         logging.info(f"Iteration {iter}: Max Success: {max_success}, Execute Rate: {execute_rate}, Max Success Reward Correlation: {max_success_reward_correlation}")
         logging.info(f"Iteration {iter}: Best Generation ID: {best_sample_idx}")
         logging.info(f"Iteration {iter}: GPT Output Content:\n" +  responses[best_sample_idx]["message"]["content"] + "\n")
-        logging.info(f"Iteration {iter}: User Content:\n" + best_content + "\n")
+        if not cfg.add_image:
+            logging.info(f"Iteration {iter}: User Content:\n" + best_content + "\n")
             
         # Plot the success rate
         fig, axs = plt.subplots(2, figsize=(6, 6))
